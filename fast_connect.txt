@@ -1,0 +1,6 @@
+LINK_SERVER=ssh root@144.172.97.90
+PASSWORD=WSrYa8ap12ymP8
+DOCKER_RUN=docker run -d -p 8000:8000 chromadb/chroma
+docker ps
+docker stop id
+docker exit

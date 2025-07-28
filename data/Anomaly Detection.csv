@@ -1,0 +1,3 @@
+timestamp,event,description
+2023-01-01 12:00:00,login,User logged in
+2023-01-01 12:05:00,error,Unexpected error occurred
