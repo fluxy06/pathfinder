@@ -2,69 +2,81 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 
 	"pathfinder/internal/chroma"
 	"pathfinder/internal/config"
-	"pathfinder/internal/embedding"
-	"pathfinder/internal/utils"
+	"pathfinder/internal/rag"
+
 	"github.com/joho/godotenv"
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
 )
 
+type AskRequest struct {
+	Question string `json:"question"`
+}
+
+type AskResponse struct {
+	Answer string `json:"answer"`
+	Error  string `json:"error,omitempty"`
+}
+
 func main() {
-	// Загружаем .env файл (если есть)
+	// Загружаем .env
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found or error loading .env")
 	}
 
-	ctx := context.Background()
-
-	// Загружаем конфигурацию
+	// Загружаем конфиг
 	cfg := config.LoadConfig()
 
-	// Инициализируем клиент Google AI
+	// Инициализируем Google AI клиента
+	ctx := context.Background()
 	client, err := genai.NewClient(ctx, option.WithAPIKey(os.Getenv("GOOGLE_API_KEY")))
 	if err != nil {
 		log.Fatalf("Ошибка создания genai клиента: %v", err)
 	}
 	defer client.Close()
 
-	// Инициализируем ChromaClient
+	// Инициализируем Chroma
 	chromaClient := chroma.NewChromaClient(cfg.ChromaHost, cfg.ChromaCollection)
 
-	// Пример текста
-	text := "Это пример текста, который будет разбит на чанки, преобразован в эмбеддинги и отправлен в ChromaDB."
+	// Роут /ask
+	http.HandleFunc("/ask", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
-	// Разбиваем на чанки
-	chunks := utils.ChunkText(text, 500, 50)
-	fmt.Printf("Разбито на %d чанков\n", len(chunks))
+		var req AskRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
 
-	// Генерируем эмбеддинги
-	embeddings, err := embedding.GenerateEmbeddings(ctx, client, chunks)
-	if err != nil {
-		log.Fatalf("Ошибка генерации эмбеддингов: %v", err)
+		answer, err := rag.AnswerQuestion(ctx, client, chromaClient, req.Question)
+		resp := AskResponse{}
+		if err != nil {
+			resp.Error = fmt.Sprintf("Ошибка: %v", err)
+		} else {
+			resp.Answer = answer
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Запуск сервера
+	port := "8080"
+	if p := os.Getenv("PORT"); p != "" {
+		port = p
 	}
-
-	// Подготавливаем ID и метаданные
-	var ids []string
-	var metadatas []map[string]string
-	for i := range chunks {
-		ids = append(ids, fmt.Sprintf("doc-%d", i))
-		metadatas = append(metadatas, map[string]string{
-			"chunk_index": fmt.Sprintf("%d", i),
-		})
-	}
-    fmt.Println("Chroma Host:", cfg.ChromaHost)
-    fmt.Println("Chroma Collection:", cfg.ChromaCollection)
-	// Добавляем документы в Chroma
-	err = chromaClient.AddDocuments(ctx, ids, chunks, embeddings, metadatas)
-	if err != nil {
-		log.Fatalf("Ошибка добавления документов в Chroma: %v", err)
-	}
-
-	fmt.Println("Документы успешно добавлены в Chroma.")
+	log.Printf("PathFinder API запущен на порту %s...\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }

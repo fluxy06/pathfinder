@@ -7,7 +7,7 @@ import (
 
     "pathfinder/internal/chroma"
     "pathfinder/internal/embedding"
-
+    
     genai "github.com/google/generative-ai-go/genai"
 )
 
