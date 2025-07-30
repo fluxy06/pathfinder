@@ -1,1 +1,2 @@
 Anomaly detection is the identification of items or events that do not conform to an expected pattern.
+Pathfinder - это программа для облегчения анализа документов!
