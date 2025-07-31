@@ -12,7 +12,6 @@ import (
 	"pathfinder/internal/config"
 	"pathfinder/internal/rag"
 
-	"github.com/joho/godotenv"
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
 )
@@ -27,17 +26,23 @@ type AskResponse struct {
 }
 
 func main() {
-	// Загружаем .env
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found or error loading .env")
-	}
-
 	// Загружаем конфиг
 	cfg := config.LoadConfig()
 
+	// Проверяем обязательные переменные
+	if cfg.GoogleAPIKey == "" {
+		log.Fatal("GOOGLE_API_KEY environment variable is required")
+	}
+	if cfg.ChromaHost == "" {
+		log.Fatal("CHROMA_HOST environment variable is required")
+	}
+	if cfg.ChromaCollection == "" {
+		log.Fatal("CHROMA_COLLECTION environment variable is required")
+	}
+
 	// Инициализируем Google AI клиента
 	ctx := context.Background()
-	client, err := genai.NewClient(ctx, option.WithAPIKey(os.Getenv("GOOGLE_API_KEY")))
+	client, err := genai.NewClient(ctx, option.WithAPIKey(cfg.GoogleAPIKey))
 	if err != nil {
 		log.Fatalf("Ошибка создания genai клиента: %v", err)
 	}
@@ -63,7 +68,9 @@ func main() {
 		answer, err := rag.AnswerQuestion(ctx, client, chromaClient, req.Question)
 		resp := AskResponse{}
 		if err != nil {
-			resp.Error = fmt.Sprintf("Ошибка: %v", err)
+			log.Printf("Error answering question: %v", err)
+			resp.Error = fmt.Sprintf("Ошибка обработки запроса: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
 		} else {
 			resp.Answer = answer
 		}
@@ -80,3 +87,8 @@ func main() {
 	log.Printf("PathFinder API запущен на порту %s...\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
+
+// TODO:
+// Понял в чем ошибка!!
+//При новом запуске коллекция не сохраняется и соответственно смысла от uuid4, который мы ранее получали и в окружение ставили нет,
+//Требуется рефакторинг кода, под автоматическую генерацию uuid4 коллекции!

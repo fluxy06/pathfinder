@@ -81,7 +81,6 @@ func (c *ChromaClient) Query(ctx context.Context, embedding []float32, topK int)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ошибка маршалинга тела запроса: %w", err)
 	}
-
 	url := fmt.Sprintf("%s/api/v2/tenants/default/databases/%s/collections/%s/query", c.host, c.database, c.collection)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(data))
 	if err != nil {
