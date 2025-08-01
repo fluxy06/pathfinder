@@ -2,93 +2,117 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
-
-	"pathfinder/internal/chroma"
-	"pathfinder/internal/config"
-	"pathfinder/internal/rag"
+	"path/filepath"
 
 	"github.com/google/generative-ai-go/genai"
+	"github.com/joho/godotenv"
 	"google.golang.org/api/option"
+
+	"pathfinder/internal/chroma"
+	"pathfinder/internal/parser"
+	"pathfinder/internal/utils"
 )
 
-type AskRequest struct {
-	Question string `json:"question"`
-}
-
-type AskResponse struct {
-	Answer string `json:"answer"`
-	Error  string `json:"error,omitempty"`
-}
+const (
+	chunkSize = 100
+	overlap   = 20
+)
 
 func main() {
-	// Загружаем конфиг
-	cfg := config.LoadConfig()
-
-	// Проверяем обязательные переменные
-	if cfg.GoogleAPIKey == "" {
-		log.Fatal("GOOGLE_API_KEY environment variable is required")
-	}
-	if cfg.ChromaHost == "" {
-		log.Fatal("CHROMA_HOST environment variable is required")
-	}
-	if cfg.ChromaCollection == "" {
-		log.Fatal("CHROMA_COLLECTION environment variable is required")
-	}
-
-	// Инициализируем Google AI клиента
 	ctx := context.Background()
-	client, err := genai.NewClient(ctx, option.WithAPIKey(cfg.GoogleAPIKey))
+
+	if err := godotenv.Load("../../.env"); err != nil {
+		log.Fatal("Ошибка загрузки .env:", err)
+	}
+
+	host := os.Getenv("CHROMA_HOST")
+	collection := os.Getenv("CHROMA_COLLECTION")
+	apiKey := os.Getenv("GOOGLE_API_KEY")
+	if host == "" || collection == "" || apiKey == "" {
+		log.Fatal("CHROMA_HOST, CHROMA_COLLECTION и GOOGLE_API_KEY обязательны")
+	}
+
+	chromaClient := chroma.NewChromaClient(host, collection)
+
+	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		log.Fatalf("Ошибка создания genai клиента: %v", err)
+		log.Fatal("Ошибка создания Gemini клиента:", err)
 	}
-	defer client.Close()
+	defer genaiClient.Close()
 
-	// Инициализируем Chroma
-	chromaClient := chroma.NewChromaClient(cfg.ChromaHost, cfg.ChromaCollection)
-
-	// Роут /ask
-	http.HandleFunc("/ask", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req AskRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
-		}
-		defer r.Body.Close()
-
-		answer, err := rag.AnswerQuestion(ctx, client, chromaClient, req.Question)
-		resp := AskResponse{}
-		if err != nil {
-			log.Printf("Error answering question: %v", err)
-			resp.Error = fmt.Sprintf("Ошибка обработки запроса: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-		} else {
-			resp.Answer = answer
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	// Запуск сервера
-	port := "8080"
-	if p := os.Getenv("PORT"); p != "" {
-		port = p
+	if err := chromaClient.EnsureCollection(ctx); err != nil {
+		log.Fatal("Ошибка создания коллекции:", err)
 	}
-	log.Printf("PathFinder API запущен на порту %s...\n", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+
+	dataDir := filepath.Join("../../data")
+	allDocs := []string{}
+
+	txtDocs, _ := parser.ParseTextFiles(dataDir)
+	allDocs = append(allDocs, txtDocs...)
+
+	jsonFiles, _ := filepath.Glob(filepath.Join(dataDir, "*.json"))
+	for _, jsonPath := range jsonFiles {
+		jsonDocs, _ := parser.ParseJSONConversations(jsonPath)
+		allDocs = append(allDocs, jsonDocs...)
+	}
+
+	csvFiles, _ := filepath.Glob(filepath.Join(dataDir, "*.csv"))
+	for _, csvPath := range csvFiles {
+		csvDocs, _ := parser.ParseCSV(csvPath)
+		allDocs = append(allDocs, csvDocs...)
+	}
+
+	log.Printf("Найдено %d документов", len(allDocs))
+
+	idCounter := 0
+	for _, doc := range allDocs {
+		chunks := utils.ChunkText(doc, chunkSize, overlap)
+		for _, chunk := range chunks {
+			embedding, err := getEmbedding(ctx, genaiClient, chunk)
+			if err != nil {
+				log.Println("Ошибка эмбеддинга:", err)
+				continue
+			}
+
+			id := fmt.Sprintf("doc-%d", idCounter)
+			err = chromaClient.AddDocuments(ctx,
+				[]string{id},
+				[]string{chunk},
+				[][]float32{embedding},
+				[]map[string]string{{"source": "ingest"}})
+
+			if err != nil {
+				log.Println("Ошибка добавления в Chroma:", err)
+			} else {
+				log.Printf("Добавлено: %s\n", id)
+			}
+			idCounter++
+		}
+	}
+
+	log.Printf("Готово! Загружено %d чанков\n", idCounter)
 }
 
-// TODO:
-// Понял в чем ошибка!!
-//При новом запуске коллекция не сохраняется и соответственно смысла от uuid4, который мы ранее получали и в окружение ставили нет,
-//Требуется рефакторинг кода, под автоматическую генерацию uuid4 коллекции!
+func getEmbedding(ctx context.Context, client *genai.Client, text string) ([]float32, error) {
+	model := client.EmbeddingModel("models/embedding-001")
+
+	resp, err := model.EmbedContent(ctx, genai.Text(text))
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения эмбеддинга: %w", err)
+	}
+
+	if resp.Embedding == nil || len(resp.Embedding.Values) == 0 {
+		return nil, fmt.Errorf("пустой ответ на эмбеддинг")
+	}
+
+	// Преобразуем []float32 из Values
+	vector := make([]float32, len(resp.Embedding.Values))
+	for i, val := range resp.Embedding.Values {
+		vector[i] = float32(val)
+	}
+
+	return vector, nil
+}
