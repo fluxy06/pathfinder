@@ -8,5 +8,5 @@ RUN CGO_ENABLED=1 go build -o pathfinder ./cmd/pathfinder
 FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=builder /app/pathfinder .
-COPY .env .
+# Копировать .env НЕ нужно, так как используем env_file
 CMD ["./pathfinder"]

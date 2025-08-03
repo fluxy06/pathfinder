@@ -2,13 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/google/generative-ai-go/genai"
-	"github.com/joho/godotenv"
 	"google.golang.org/api/option"
 
 	"pathfinder/internal/chroma"
@@ -24,17 +26,21 @@ const (
 func main() {
 	ctx := context.Background()
 
-	if err := godotenv.Load("../../.env"); err != nil {
-		log.Fatal("Ошибка загрузки .env:", err)
-	}
-
+	// Получаем переменные окружения
 	host := os.Getenv("CHROMA_HOST")
 	collection := os.Getenv("CHROMA_COLLECTION")
 	apiKey := os.Getenv("GOOGLE_API_KEY")
+
 	if host == "" || collection == "" || apiKey == "" {
 		log.Fatal("CHROMA_HOST, CHROMA_COLLECTION и GOOGLE_API_KEY обязательны")
 	}
 
+	// Ждем пока сервис Chroma станет доступен
+	if err := waitForChromaReady(host+"/health", 30*time.Second); err != nil {
+		log.Fatal("Chroma сервис не доступен:", err)
+	}
+
+	// Инициализация клиентов
 	chromaClient := chroma.NewChromaClient(host, collection)
 
 	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
@@ -43,13 +49,16 @@ func main() {
 	}
 	defer genaiClient.Close()
 
+	// Убедимся, что коллекция существует или создадим её
 	if err := chromaClient.EnsureCollection(ctx); err != nil {
 		log.Fatal("Ошибка создания коллекции:", err)
 	}
 
-	dataDir := filepath.Join("../../data")
+	// Путь к папке data внутри контейнера
+	dataDir := filepath.Join("data")
 	allDocs := []string{}
 
+	// Парсим документы
 	txtDocs, _ := parser.ParseTextFiles(dataDir)
 	allDocs = append(allDocs, txtDocs...)
 
@@ -67,6 +76,7 @@ func main() {
 
 	log.Printf("Найдено %d документов", len(allDocs))
 
+	// Обрабатываем документы и отправляем в Chroma
 	idCounter := 0
 	for _, doc := range allDocs {
 		chunks := utils.ChunkText(doc, chunkSize, overlap)
@@ -96,6 +106,21 @@ func main() {
 	log.Printf("Готово! Загружено %d чанков\n", idCounter)
 }
 
+// waitForChromaReady ждёт, пока Chroma API не ответит с HTTP 200 или таймаут
+func waitForChromaReady(url string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			return errors.New("таймаут ожидания сервиса Chroma")
+		}
+		resp, err := http.Get(url)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
 func getEmbedding(ctx context.Context, client *genai.Client, text string) ([]float32, error) {
 	model := client.EmbeddingModel("models/embedding-001")
 
@@ -108,7 +133,6 @@ func getEmbedding(ctx context.Context, client *genai.Client, text string) ([]flo
 		return nil, fmt.Errorf("пустой ответ на эмбеддинг")
 	}
 
-	// Преобразуем []float32 из Values
 	vector := make([]float32, len(resp.Embedding.Values))
 	for i, val := range resp.Embedding.Values {
 		vector[i] = float32(val)
