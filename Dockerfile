@@ -1,4 +1,5 @@
-FROM golang:1.23.6-bookworm AS builder
+# стабильная версия golang; 1.23.6 может отсутствовать
+FROM golang:1.22-bookworm AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
@@ -8,5 +9,5 @@ RUN CGO_ENABLED=1 go build -o pathfinder ./cmd/pathfinder
 FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=builder /app/pathfinder .
-# Копировать .env НЕ нужно, так как используем env_file
-CMD ["./pathfinder"]
+# данные монтируются из compose
+ENTRYPOINT ["./pathfinder"]

@@ -7,49 +7,48 @@ import (
 	"github.com/google/generative-ai-go/genai"
 )
 
-// GenerateEmbedding создает эмбеддинг для одного текста
-func GenerateEmbedding(ctx context.Context, client *genai.Client, text string) ([]float32, error) {
-	model := client.EmbeddingModel("models/embedding-001")
+const EmbeddingModel = "gemini-embedding-001" // актуальная на 2025-08
 
+func GenerateEmbedding(ctx context.Context, client *genai.Client, text string, dim int) ([]float32, error) {
+	model := client.EmbeddingModel(EmbeddingModel)
+	if dim > 0 {
+		model = model.WithOutputDimensionality(int32(dim))
+	}
 	resp, err := model.EmbedContent(ctx, genai.Text(text))
 	if err != nil {
-		return nil, fmt.Errorf("ошибка генерации эмбеддинга: %w", err)
+		return nil, fmt.Errorf("embedding error: %w", err)
 	}
-
 	if resp.Embedding == nil || len(resp.Embedding.Values) == 0 {
-		return nil, fmt.Errorf("пустой эмбеддинг")
+		return nil, fmt.Errorf("empty embedding")
 	}
-
-	// Преобразуем []float64 → []float32
-	values := make([]float32, len(resp.Embedding.Values))
+	vec := make([]float32, len(resp.Embedding.Values))
 	for i, v := range resp.Embedding.Values {
-		values[i] = float32(v)
+		vec[i] = float32(v)
 	}
-
-	return values, nil
+	return vec, nil
 }
 
-// GenerateEmbeddings создает эмбеддинги для массива текстов
-func GenerateEmbeddings(ctx context.Context, client *genai.Client, texts []string) ([][]float32, error) {
-	model := client.EmbeddingModel("models/embedding-001")
-
-	var result [][]float32
-
-	for _, text := range texts {
-		resp, err := model.EmbedContent(ctx, genai.Text(text))
-		if err != nil {
-			return nil, fmt.Errorf("ошибка генерации эмбеддинга для текста: %w", err)
-		}
-		if resp.Embedding == nil || len(resp.Embedding.Values) == 0 {
-			return nil, fmt.Errorf("пустой эмбеддинг")
-		}
-
-		values := make([]float32, len(resp.Embedding.Values))
-		for i, v := range resp.Embedding.Values {
-			values[i] = float32(v)
-		}
-		result = append(result, values)
+// батч-версия — экономит вызовы
+func GenerateEmbeddingsBatch(ctx context.Context, client *genai.Client, texts []string, dim int) ([][]float32, error) {
+	m := client.EmbeddingModel(EmbeddingModel)
+	if dim > 0 {
+		m = m.WithOutputDimensionality(int32(dim))
 	}
-
-	return result, nil
+	b := m.NewBatch()
+	for _, t := range texts {
+		b.AddContent(genai.Text(t))
+	}
+	res, err := m.BatchEmbedContents(ctx, b)
+	if err != nil {
+		return nil, fmt.Errorf("batch embedding error: %w", err)
+	}
+	out := make([][]float32, 0, len(res.Embeddings))
+	for _, e := range res.Embeddings {
+		vec := make([]float32, len(e.Values))
+		for i, v := range e.Values {
+			vec[i] = float32(v)
+		}
+		out = append(out, vec)
+	}
+	return out, nil
 }

@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/generative-ai-go/genai"
@@ -15,128 +17,156 @@ import (
 
 	"pathfinder/internal/chroma"
 	"pathfinder/internal/parser"
+	"pathfinder/internal/rag"
 	"pathfinder/internal/utils"
+	"pathfinder/internal/embedding"
 )
 
 const (
-	chunkSize = 100
-	overlap   = 20
+	defaultChunkSize = 180 // слов
+	defaultOverlap   = 30
 )
 
 func main() {
 	ctx := context.Background()
 
-	// Получаем переменные окружения
-	host := os.Getenv("CHROMA_HOST")
-	collection := os.Getenv("CHROMA_COLLECTION")
+	// сабкоманды: ingest / ask
+	if len(os.Args) < 2 {
+		fmt.Println("usage:")
+		fmt.Println("  pathfinder ingest --data ./data")
+		fmt.Println("  pathfinder ask \"ваш вопрос\" -k 5")
+		os.Exit(1)
+	}
+
+	host := getEnv("CHROMA_HOST", "http://localhost:8000")
+	collection := getEnv("CHROMA_COLLECTION", "pathfinder")
 	apiKey := os.Getenv("GOOGLE_API_KEY")
-
-	if host == "" || collection == "" || apiKey == "" {
-		log.Fatal("CHROMA_HOST, CHROMA_COLLECTION и GOOGLE_API_KEY обязательны")
+	if apiKey == "" {
+		log.Fatal("GOOGLE_API_KEY обязателен")
 	}
 
-	// Ждем пока сервис Chroma станет доступен
+	// ждём chroma
 	if err := waitForChromaReady(host+"/health", 30*time.Second); err != nil {
-		log.Fatal("Chroma сервис не доступен:", err)
+		log.Fatal("Chroma недоступна:", err)
 	}
 
-	// Инициализация клиентов
 	chromaClient := chroma.NewChromaClient(host, collection)
+	if err := chromaClient.EnsureCollection(ctx); err != nil {
+		log.Fatal("Коллекция:", err)
+	}
 
 	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		log.Fatal("Ошибка создания Gemini клиента:", err)
+		log.Fatal("Gemini client error:", err)
 	}
 	defer genaiClient.Close()
 
-	// Убедимся, что коллекция существует или создадим её
-	if err := chromaClient.EnsureCollection(ctx); err != nil {
-		log.Fatal("Ошибка создания коллекции:", err)
+	switch os.Args[1] {
+	case "ingest":
+		fs := flag.NewFlagSet("ingest", flag.ExitOnError)
+		dataDir := fs.String("data", "./data", "папка с данными")
+		chunk := fs.Int("chunk", defaultChunkSize, "размер чанка (в словах)")
+		ov := fs.Int("overlap", defaultOverlap, "перекрытие (в словах)")
+		dim := fs.Int("dim", 3072, "размерность эмбеддинга (рекомендуется 3072 для gemini-embedding-001)")
+		_ = fs.Parse(os.Args[2:])
+		if err := ingest(ctx, genaiClient, chromaClient, *dataDir, *chunk, *ov, *dim); err != nil {
+			log.Fatal(err)
+		}
+	case "ask":
+		fs := flag.NewFlagSet("ask", flag.ExitOnError)
+		k := fs.Int("k", 5, "сколько фрагментов вернуть")
+		_ = fs.Parse(os.Args[2:])
+		if fs.NArg() < 1 {
+			log.Fatal("нужен вопрос: pathfinder ask \"...\"")
+		}
+		question := strings.Join(fs.Args(), " ")
+		ans, err := rag.AnswerQuestion(ctx, genaiClient, chromaClient, question, *k)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(ans)
+	default:
+		log.Fatalf("неизвестная команда: %s", os.Args[1])
 	}
+}
 
-	// Путь к папке data внутри контейнера
-	dataDir := filepath.Join("data")
-	allDocs := []string{}
+func ingest(ctx context.Context, genaiClient *genai.Client, chromaClient *chroma.ChromaClient, dataDir string, chunkSize, overlap, dim int) error {
+	var parsed []parser.ParsedDoc
 
-	// Парсим документы
-	txtDocs, _ := parser.ParseTextFiles(dataDir)
-	allDocs = append(allDocs, txtDocs...)
+	txt, _ := parser.ParseTextFiles(dataDir)
+	parsed = append(parsed, txt...)
 
 	jsonFiles, _ := filepath.Glob(filepath.Join(dataDir, "*.json"))
-	for _, jsonPath := range jsonFiles {
-		jsonDocs, _ := parser.ParseJSONConversations(jsonPath)
-		allDocs = append(allDocs, jsonDocs...)
+	for _, p := range jsonFiles {
+		docs, _ := parser.ParseJSONConversations(p)
+		parsed = append(parsed, docs...)
 	}
 
 	csvFiles, _ := filepath.Glob(filepath.Join(dataDir, "*.csv"))
-	for _, csvPath := range csvFiles {
-		csvDocs, _ := parser.ParseCSV(csvPath)
-		allDocs = append(allDocs, csvDocs...)
+	for _, p := range csvFiles {
+		docs, _ := parser.ParseCSV(p)
+		parsed = append(parsed, docs...)
 	}
 
-	log.Printf("Найдено %d документов", len(allDocs))
+	log.Printf("Найдено документов: %d", len(parsed))
 
-	// Обрабатываем документы и отправляем в Chroma
+	// чанкуем
+	var chunks []string
+	var metas []map[string]string
+	for _, d := range parsed {
+		for _, c := range utils.ChunkText(d.Text, chunkSize, overlap) {
+			if strings.TrimSpace(c) == "" { continue }
+			chunks = append(chunks, c)
+			metas = append(metas, d.Meta)
+		}
+	}
+	log.Printf("Чанков к индексации: %d", len(chunks))
+
+	// батчим эмбеддинги
+	const batchSize = 64
 	idCounter := 0
-	for _, doc := range allDocs {
-		chunks := utils.ChunkText(doc, chunkSize, overlap)
-		for _, chunk := range chunks {
-			embedding, err := getEmbedding(ctx, genaiClient, chunk)
-			if err != nil {
-				log.Println("Ошибка эмбеддинга:", err)
-				continue
-			}
-
-			id := fmt.Sprintf("doc-%d", idCounter)
-			err = chromaClient.AddDocuments(ctx,
-				[]string{id},
-				[]string{chunk},
-				[][]float32{embedding},
-				[]map[string]string{{"source": "ingest"}})
-
-			if err != nil {
-				log.Println("Ошибка добавления в Chroma:", err)
-			} else {
-				log.Printf("Добавлено: %s\n", id)
-			}
+	for i := 0; i < len(chunks); i += batchSize {
+		j := i + batchSize
+		if j > len(chunks) { j = len(chunks) }
+		batch := chunks[i:j]
+		vecs, err := embedding.GenerateEmbeddingsBatch(ctx, genaiClient, batch, dim)
+		if err != nil {
+			return fmt.Errorf("batch %d..%d: %w", i, j, err)
+		}
+		ids := make([]string, 0, len(batch))
+		mds := make([]map[string]string, 0, len(batch))
+		for range batch {
+			ids = append(ids, fmt.Sprintf("doc-%d", idCounter))
+			mds = append(mds, metas[i])
 			idCounter++
+		}
+		if err := chromaClient.Upsert(ctx, ids, batch, vecs, mds); err != nil {
+			return fmt.Errorf("upsert: %w", err)
 		}
 	}
 
-	log.Printf("Готово! Загружено %d чанков\n", idCounter)
+	log.Printf("Готово! Загружено чанков: %d", idCounter)
+	return nil
 }
 
-// waitForChromaReady ждёт, пока Chroma API не ответит с HTTP 200 или таймаут
+// --- utils ---
+
 func waitForChromaReady(url string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		if time.Now().After(deadline) {
-			return errors.New("таймаут ожидания сервиса Chroma")
+			return errors.New("таймаут ожидания Chroma")
 		}
 		resp, err := http.Get(url)
 		if err == nil && resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
 			return nil
 		}
 		time.Sleep(1 * time.Second)
 	}
 }
 
-func getEmbedding(ctx context.Context, client *genai.Client, text string) ([]float32, error) {
-	model := client.EmbeddingModel("models/embedding-001")
-
-	resp, err := model.EmbedContent(ctx, genai.Text(text))
-	if err != nil {
-		return nil, fmt.Errorf("ошибка получения эмбеддинга: %w", err)
-	}
-
-	if resp.Embedding == nil || len(resp.Embedding.Values) == 0 {
-		return nil, fmt.Errorf("пустой ответ на эмбеддинг")
-	}
-
-	vector := make([]float32, len(resp.Embedding.Values))
-	for i, val := range resp.Embedding.Values {
-		vector[i] = float32(val)
-	}
-
-	return vector, nil
+func getEnv(k, def string) string {
+	if v := os.Getenv(k); v != "" { return v }
+	return def
 }

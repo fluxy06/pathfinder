@@ -1,20 +1,26 @@
 version: "3.9"
-
 services:
   chroma:
     image: chromadb/chroma:0.4.24
-    ports:
-      - "8000:8000"
+    ports: ["8000:8000"]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   pathfinder:
     build: .
-    ports:
-      - "8080:8080"
-    env_file:
-      - .env
+    # CLI-приложение — порт не нужен, но оставим на будущее (веб)
+    # ports: ["8080:8080"]
+    env_file: [.env]
+    environment:
+      # важный момент: внутри сети docker используем сервисное имя chroma
+      CHROMA_HOST: http://chroma:8000
     volumes:
       - ./data:/app/data
     depends_on:
-      - chroma
+      chroma:
+        condition: service_healthy
     restart: unless-stopped

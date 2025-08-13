@@ -15,158 +15,115 @@ type ChromaClient struct {
 }
 
 func NewChromaClient(host, collection string) *ChromaClient {
-	return &ChromaClient{
-		host:       host,
-		collection: collection,
-	}
+	return &ChromaClient{host: host, collection: collection}
 }
 
-// EnsureCollection проверяет существование коллекции и создаёт её при необходимости (API v1)
+// EnsureCollection: если нет — создаём с cosine
 func (c *ChromaClient) EnsureCollection(ctx context.Context) error {
-	url := fmt.Sprintf("%s/api/v1/collections/%s", c.host, c.collection)
-
-	// Проверка
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("ошибка создания запроса на проверку коллекции: %w", err)
-	}
+	getURL := fmt.Sprintf("%s/api/v1/collections/%s", c.host, c.collection)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("ошибка запроса при проверке коллекции: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		fmt.Printf("Коллекция '%s' уже существует\n", c.collection)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		resp.Body.Close()
+		fmt.Printf("Коллекция '%s' существует\n", c.collection)
 		return nil
 	}
+	if resp != nil { resp.Body.Close() }
 
-	if resp.StatusCode != http.StatusNotFound {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("ошибка при проверке коллекции: %s", string(body))
-	}
-
-	// Создание коллекции
 	createURL := fmt.Sprintf("%s/api/v1/collections", c.host)
-	payload := map[string]string{
+	body := map[string]any{
 		"name": c.collection,
+		"metadata": map[string]any{
+			"hnsw:space": "cosine",
+		},
 	}
-	body, _ := json.Marshal(payload)
-
-	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewBuffer(body))
-	if err != nil {
-		return fmt.Errorf("ошибка создания запроса на создание коллекции: %w", err)
+	data, _ := json.Marshal(body)
+	cr, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewBuffer(data))
+	if err != nil { return err }
+	cr.Header.Set("Content-Type", "application/json")
+	rs, err := http.DefaultClient.Do(cr)
+	if err != nil { return err }
+	defer rs.Body.Close()
+	if rs.StatusCode != http.StatusOK && rs.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(rs.Body)
+		return fmt.Errorf("create collection failed: %s", string(b))
 	}
-	createReq.Header.Set("Content-Type", "application/json")
-
-	createResp, err := http.DefaultClient.Do(createReq)
-	if err != nil {
-		return fmt.Errorf("ошибка при создании коллекции: %w", err)
-	}
-	defer createResp.Body.Close()
-
-	if createResp.StatusCode != http.StatusOK && createResp.StatusCode != http.StatusCreated {
-		respBody, _ := io.ReadAll(createResp.Body)
-		return fmt.Errorf("ошибка создания коллекции: %s", string(respBody))
-	}
-
-	fmt.Printf("Коллекция '%s' успешно создана\n", c.collection)
+	fmt.Printf("Коллекция '%s' создана (cosine)\n", c.collection)
 	return nil
 }
 
-// AddDocuments добавляет документы в коллекцию (API v1)
-func (c *ChromaClient) AddDocuments(ctx context.Context, ids []string, documents []string, embeddings [][]float32, metadatas []map[string]string) error {
+func (c *ChromaClient) Upsert(ctx context.Context, ids []string, documents []string, embeddings [][]float32, metadatas []map[string]string) error {
 	if len(ids) != len(documents) || len(ids) != len(embeddings) {
-		return fmt.Errorf("количество ids, documents и embeddings не совпадает")
+		return fmt.Errorf("len mismatch ids/docs/embeddings")
 	}
-
-	var records []map[string]interface{}
+	records := make([]map[string]any, 0, len(ids))
 	for i := range ids {
-		record := map[string]interface{}{
+		rec := map[string]any{
 			"id":        ids[i],
 			"document":  documents[i],
 			"embedding": embeddings[i],
 		}
-		if i < len(metadatas) && len(metadatas[i]) > 0 {
-			record["metadata"] = metadatas[i]
+		if i < len(metadatas) && metadatas[i] != nil {
+			rec["metadata"] = metadatas[i]
 		}
-		records = append(records, record)
+		records = append(records, rec)
 	}
-
-	body := map[string]interface{}{
-		"records": records,
-	}
-
-	data, _ := json.MarshalIndent(body, "", "  ")
-	fmt.Println("AddDocuments payload:", string(data))
+	payload := map[string]any{ "records": records }
+	data, _ := json.Marshal(payload)
 
 	url := fmt.Sprintf("%s/api/v1/collections/%s/upsert", c.host, c.collection)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(data))
-	if err != nil {
-		return fmt.Errorf("ошибка создания запроса: %w", err)
-	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("ошибка выполнения запроса к Chroma: %w", err)
-	}
+	if err != nil { return err }
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("Chroma вернула ошибку: %s, %s", resp.Status, string(respBody))
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("chroma upsert error: %s %s", resp.Status, string(b))
 	}
-
 	return nil
 }
 
-// Query выполняет поиск по эмбеддингу (API v1)
-func (c *ChromaClient) Query(ctx context.Context, embedding []float32, topK int) ([]string, []map[string]string, error) {
-	body := map[string]interface{}{
+// Query по схеме arrays + include
+type QueryResult struct {
+	IDs        [][]string               `json:"ids"`
+	Documents  [][]string               `json:"documents"`
+	Metadatas  [][]map[string]string    `json:"metadatas"`
+	Distances  [][]float64              `json:"distances"`
+}
+
+func (c *ChromaClient) Query(ctx context.Context, embedding []float32, topK int) ([]string, []map[string]string, []float64, error) {
+	body := map[string]any{
 		"query_embeddings": [][]float32{embedding},
 		"n_results":        topK,
+		"include":          []string{"documents", "metadatas", "distances", "ids"},
 	}
-
-	data, err := json.Marshal(body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("ошибка маршалинга тела запроса: %w", err)
-	}
+	data, _ := json.Marshal(body)
 	url := fmt.Sprintf("%s/api/v1/collections/%s/query", c.host, c.collection)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(data))
-	if err != nil {
-		return nil, nil, fmt.Errorf("ошибка создания запроса: %w", err)
-	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("ошибка запроса к Chroma: %w", err)
-	}
+	if err != nil { return nil, nil, nil, err }
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, nil, fmt.Errorf("ошибка от Chroma: %s, %s", resp.Status, string(respBody))
+		b, _ := io.ReadAll(resp.Body)
+		return nil, nil, nil, fmt.Errorf("chroma query error: %s %s", resp.Status, string(b))
 	}
-
-	var result struct {
-		Records []struct {
-			Document string            `json:"document"`
-			Metadata map[string]string `json:"metadata"`
-		} `json:"records"`
+	var qr QueryResult
+	if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
+		return nil, nil, nil, err
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, nil, fmt.Errorf("ошибка парсинга ответа Chroma: %w", err)
+	docs := []string{}
+	metas := []map[string]string{}
+	dists := []float64{}
+	if len(qr.Documents) > 0 {
+		docs = append(docs, qr.Documents[0]...)
 	}
-
-	var docs []string
-	var metas []map[string]string
-	for _, r := range result.Records {
-		docs = append(docs, r.Document)
-		metas = append(metas, r.Metadata)
+	if len(qr.Metadatas) > 0 {
+		metas = append(metas, qr.Metadatas[0]...)
 	}
-
-	return docs, metas, nil
+	if len(qr.Distances) > 0 {
+		dists = append(dists, qr.Distances[0]...)
+	}
+	return docs, metas, dists, nil
 }
